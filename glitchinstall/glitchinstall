@@ -1,3 +1,0 @@
-#!/bin/bash
-# launcher for Glitch Installer
-sudo python3 /usr/share/glitchinstall/glitchinstall.py
