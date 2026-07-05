@@ -738,6 +738,9 @@ class InstallWorker(QThread):
     def _create_partitions(self, cfg):
         dev = cfg['target_device']
         boot_type = cfg['boot_type']
+        root_fs = cfg.get('root_fs', 'ext4')
+        boot_fs = cfg.get('boot_fs', 'ext4')
+        efi_size = cfg.get('efi_size', 96)
         is_loop = dev.startswith("/dev/loop")
         sep = "p" if is_loop or "nvme" in dev else ""
 
@@ -750,8 +753,8 @@ class InstallWorker(QThread):
             if cfg.get('separate_boot'):
                 boot_size = cfg.get('boot_size', 512)
                 self.exec_cmd(
-                    f"parted -s {dev} mkpart primary ext4 1MiB {boot_size}MiB",
-                    f"Creating /boot partition ({boot_size}MB)")
+                    f"parted -s {dev} mkpart primary {boot_fs} 1MiB {boot_size}MiB",
+                    f"Creating /boot partition ({boot_size}MB, {boot_fs})")
                 self.exec_cmd(f"parted -s {dev} set 1 boot on")
                 cfg['boot_partition'] = f"{dev}{sep}{part_num}"
                 part_num += 1
@@ -760,8 +763,8 @@ class InstallWorker(QThread):
                 start = "1MiB"
 
             self.exec_cmd(
-                f"parted -s {dev} mkpart primary ext4 {start} 100%",
-                "Creating root partition")
+                f"parted -s {dev} mkpart primary {root_fs} {start} 100%",
+                f"Creating root partition ({root_fs})")
             if not cfg.get('separate_boot'):
                 self.exec_cmd(f"parted -s {dev} set 1 boot on")
             cfg['data_partition'] = f"{dev}{sep}{part_num}"
@@ -776,8 +779,8 @@ class InstallWorker(QThread):
                 boot_size = cfg.get('boot_size', 512)
                 boot_end = 2 + boot_size
                 self.exec_cmd(
-                    f"parted -s {dev} mkpart BOOT ext4 2MiB {boot_end}MiB",
-                    f"Creating /boot partition ({boot_size}MB)")
+                    f"parted -s {dev} mkpart BOOT {boot_fs} 2MiB {boot_end}MiB",
+                    f"Creating /boot partition ({boot_size}MB, {boot_fs})")
                 self.exec_cmd(f"parted -s {dev} set 2 boot on")
                 cfg['boot_partition'] = f"{dev}{sep}{part_num}"
                 part_num += 1
@@ -786,33 +789,34 @@ class InstallWorker(QThread):
                 start = "2MiB"
 
             self.exec_cmd(
-                f"parted -s {dev} mkpart ROOT ext4 {start} 100%",
-                "Creating root partition")
+                f"parted -s {dev} mkpart ROOT {root_fs} {start} 100%",
+                f"Creating root partition ({root_fs})")
             cfg['data_partition'] = f"{dev}{sep}{part_num}"
 
         elif boot_type == 'uefi':
+            efi_end = efi_size + 1  # 1MiB aligned start
             self.exec_cmd(f"parted -s {dev} mklabel gpt", "Creating GPT partition table")
-            self.exec_cmd(f"parted -s {dev} mkpart EFI fat32 1MiB 97MiB")
+            self.exec_cmd(f"parted -s {dev} mkpart EFI fat32 1MiB {efi_end}MiB")
             self.exec_cmd(f"parted -s {dev} set 1 esp on")
             cfg['efi_partition'] = f"{dev}{sep}1"
-            self.log(f"✓ EFI partition created: {cfg['efi_partition']}", "SUCCESS")
+            self.log(f"✓ EFI partition created: {cfg['efi_partition']} ({efi_size}MB)", "SUCCESS")
             part_num = 2
 
             if cfg.get('separate_boot'):
                 boot_size = cfg.get('boot_size', 512)
-                boot_end = 97 + boot_size
+                boot_end = efi_end + boot_size
                 self.exec_cmd(
-                    f"parted -s {dev} mkpart BOOT ext4 97MiB {boot_end}MiB",
-                    f"Creating /boot partition ({boot_size}MB)")
+                    f"parted -s {dev} mkpart BOOT {boot_fs} {efi_end}MiB {boot_end}MiB",
+                    f"Creating /boot partition ({boot_size}MB, {boot_fs})")
                 cfg['boot_partition'] = f"{dev}{sep}{part_num}"
                 part_num += 1
                 start = f"{boot_end}MiB"
             else:
-                start = "97MiB"
+                start = f"{efi_end}MiB"
 
             self.exec_cmd(
-                f"parted -s {dev} mkpart ROOT ext4 {start} 100%",
-                "Creating root partition")
+                f"parted -s {dev} mkpart ROOT {root_fs} {start} 100%",
+                f"Creating root partition ({root_fs})")
             cfg['data_partition'] = f"{dev}{sep}{part_num}"
 
         time.sleep(2)
@@ -837,11 +841,11 @@ class InstallWorker(QThread):
         self.exec_cmd("udevadm settle --timeout=5 2>/dev/null || true")
 
         # Format the root partition (user expects a clean install)
+        root_fs = cfg.get('root_fs', 'ext4')
         if not cfg.get('luks_enabled'):
-            self.exec_cmd(
-                f"mkfs.ext4 -F -L ROOT {data_part}",
-                "Formatting root partition (ext4)")
-            self.log(f"✓ Root partition formatted: {data_part}", "SUCCESS")
+            mkfs_cmd = self._get_mkfs_cmd(root_fs, data_part, "ROOT")
+            self.exec_cmd(mkfs_cmd, f"Formatting root partition ({root_fs})")
+            self.log(f"✓ Root partition formatted: {data_part} ({root_fs})", "SUCCESS")
 
     def _format_partitions(self, cfg):
         if cfg.get('efi_partition') and cfg['partitioning'] == 'erase':
@@ -852,16 +856,28 @@ class InstallWorker(QThread):
 
         if cfg.get('separate_boot') and cfg.get('boot_partition') and cfg['partitioning'] == 'erase':
             boot_fs = cfg.get('boot_fs', 'ext4')
-            self.exec_cmd(
-                f"mkfs.{boot_fs} -F -L BOOT {cfg['boot_partition']}",
-                f"Formatting /boot partition ({boot_fs})")
-            self.log(f"✓ Boot partition formatted: {cfg['boot_partition']}", "SUCCESS")
+            mkfs_cmd = self._get_mkfs_cmd(boot_fs, cfg['boot_partition'], "BOOT")
+            self.exec_cmd(mkfs_cmd, f"Formatting /boot partition ({boot_fs})")
+            self.log(f"✓ Boot partition formatted: {cfg['boot_partition']} ({boot_fs})", "SUCCESS")
 
         if not cfg.get('luks_enabled') and cfg['partitioning'] == 'erase':
-            self.exec_cmd(
-                f"mkfs.ext4 -F -L ROOT {cfg['data_partition']}",
-                "Formatting root partition (ext4)")
-            self.log(f"✓ Root partition formatted: {cfg['data_partition']}", "SUCCESS")
+            root_fs = cfg.get('root_fs', 'ext4')
+            mkfs_cmd = self._get_mkfs_cmd(root_fs, cfg['data_partition'], "ROOT")
+            self.exec_cmd(mkfs_cmd, f"Formatting root partition ({root_fs})")
+            self.log(f"✓ Root partition formatted: {cfg['data_partition']} ({root_fs})", "SUCCESS")
+
+    def _get_mkfs_cmd(self, fs_type, device, label="ROOT"):
+        """Build the appropriate mkfs command for the given filesystem type."""
+        if fs_type == 'btrfs':
+            return f"mkfs.btrfs -f -L {label} {device}"
+        elif fs_type == 'xfs':
+            return f"mkfs.xfs -f -L {label} {device}"
+        elif fs_type == 'f2fs':
+            return f"mkfs.f2fs -f -l {label} {device}"
+        elif fs_type == 'ext2':
+            return f"mkfs.ext2 -F -L {label} {device}"
+        else:  # ext4 default
+            return f"mkfs.ext4 -F -L {label} {device}"
 
     def _setup_luks(self, cfg):
         data_part = cfg['data_partition']
@@ -892,10 +908,10 @@ class InstallWorker(QThread):
         self.luks_device = f"/dev/mapper/{self.luks_mapper}"
         self.log(f"✓ LUKS partition opened as {self.luks_device}", "SUCCESS")
 
-        self.exec_cmd(
-            f"mkfs.ext4 -F -L ROOT {self.luks_device}",
-            "Formatting encrypted partition (ext4)")
-        self.log("✓ Encrypted partition formatted", "SUCCESS")
+        root_fs = cfg.get('root_fs', 'ext4')
+        mkfs_cmd = self._get_mkfs_cmd(root_fs, self.luks_device, "ROOT")
+        self.exec_cmd(mkfs_cmd, f"Formatting encrypted partition ({root_fs})")
+        self.log(f"✓ Encrypted partition formatted ({root_fs})", "SUCCESS")
 
         # Update data partition to mapper device
         cfg['data_partition_actual'] = self.luks_device
@@ -1611,6 +1627,14 @@ class PartitionScreen(QWidget):
         self.combo_root_part = QComboBox()
         self.combo_root_part.setMinimumWidth(200)
         part_layout.addWidget(self.combo_root_part)
+        part_layout.addWidget(QLabel("Format as:"))
+        self.combo_existing_root_fs = QComboBox()
+        self.combo_existing_root_fs.addItem("ext4", "ext4")
+        self.combo_existing_root_fs.addItem("btrfs", "btrfs")
+        self.combo_existing_root_fs.addItem("xfs", "xfs")
+        self.combo_existing_root_fs.addItem("f2fs", "f2fs")
+        self.combo_existing_root_fs.setMinimumWidth(100)
+        part_layout.addWidget(self.combo_existing_root_fs)
         part_layout.addStretch()
         existing_layout.addLayout(part_layout)
 
@@ -1660,6 +1684,35 @@ class PartitionScreen(QWidget):
         bt_layout.addStretch()
         erase_layout.addLayout(bt_layout)
 
+        # Root filesystem type
+        rootfs_layout = QHBoxLayout()
+        rootfs_layout.addWidget(QLabel("Root filesystem:"))
+        self.combo_root_fs = QComboBox()
+        self.combo_root_fs.addItem("ext4 (recommended)", "ext4")
+        self.combo_root_fs.addItem("btrfs", "btrfs")
+        self.combo_root_fs.addItem("xfs", "xfs")
+        self.combo_root_fs.addItem("f2fs", "f2fs")
+        self.combo_root_fs.setMinimumWidth(180)
+        rootfs_layout.addWidget(self.combo_root_fs)
+        rootfs_layout.addStretch()
+        erase_layout.addLayout(rootfs_layout)
+
+        # EFI partition size (shown only for UEFI)
+        self.efi_size_widget = QWidget()
+        efi_size_layout = QHBoxLayout(self.efi_size_widget)
+        efi_size_layout.setContentsMargins(0, 0, 0, 0)
+        efi_size_layout.addWidget(QLabel("EFI partition size (MB):"))
+        self.spin_efi_size = QSpinBox()
+        self.spin_efi_size.setRange(96, 1024)
+        self.spin_efi_size.setValue(96)
+        self.spin_efi_size.setSingleStep(32)
+        efi_size_layout.addWidget(self.spin_efi_size)
+        efi_size_layout.addStretch()
+        self.efi_size_widget.setVisible(False)
+        erase_layout.addWidget(self.efi_size_widget)
+
+        self.combo_boot_type.currentIndexChanged.connect(self._update_efi_visibility)
+
         # Separate /boot
         boot_layout = QHBoxLayout()
         self.chk_separate_boot = QCheckBox("Create separate /boot partition")
@@ -1673,7 +1726,22 @@ class PartitionScreen(QWidget):
         boot_layout.addStretch()
         erase_layout.addLayout(boot_layout)
 
+        # /boot filesystem (visible when separate boot is checked)
+        self.boot_fs_widget = QWidget()
+        boot_fs_layout = QHBoxLayout(self.boot_fs_widget)
+        boot_fs_layout.setContentsMargins(0, 0, 0, 0)
+        boot_fs_layout.addWidget(QLabel("/boot filesystem:"))
+        self.combo_boot_fs = QComboBox()
+        self.combo_boot_fs.addItem("ext4 (recommended)", "ext4")
+        self.combo_boot_fs.addItem("ext2", "ext2")
+        self.combo_boot_fs.setMinimumWidth(180)
+        boot_fs_layout.addWidget(self.combo_boot_fs)
+        boot_fs_layout.addStretch()
+        self.boot_fs_widget.setVisible(False)
+        erase_layout.addWidget(self.boot_fs_widget)
+
         self.chk_separate_boot.toggled.connect(self.spin_boot_size.setEnabled)
+        self.chk_separate_boot.toggled.connect(self.boot_fs_widget.setVisible)
 
         warn2 = QLabel("⚠ ALL DATA on the disk will be erased!")
         warn2.setStyleSheet("color: #ff0000; font-weight: bold;")
@@ -1699,6 +1767,11 @@ class PartitionScreen(QWidget):
         self.btn_next.setObjectName("primary")
         btn_layout.addWidget(self.btn_next)
         layout.addLayout(btn_layout)
+
+    def _update_efi_visibility(self, index):
+        """Show/hide EFI size spinner based on boot type selection."""
+        boot_type = self.combo_boot_type.currentData()
+        self.efi_size_widget.setVisible(boot_type == 'uefi')
 
     def load_partitions(self, device):
         """Populate partition combos for the selected device."""
@@ -2049,7 +2122,10 @@ class ReviewScreen(QWidget):
             lines.append(f"  Partitioning:             Use Existing Partitions")
 
         lines.append(f"  Boot Type:                {config.get('boot_type', '?')}")
-        lines.append(f"  Separate /boot:           {'Yes (' + str(config.get('boot_size', 512)) + ' MB)' if config.get('separate_boot') else 'No'}")
+        lines.append(f"  Root Filesystem:          {config.get('root_fs', 'ext4')}")
+        if config.get('boot_type') == 'uefi' and config.get('partitioning') == 'erase':
+            lines.append(f"  EFI Partition Size:       {config.get('efi_size', 96)} MB")
+        lines.append(f"  Separate /boot:           {'Yes (' + str(config.get('boot_size', 512)) + ' MB, ' + config.get('boot_fs', 'ext4') + ')' if config.get('separate_boot') else 'No'}")
 
         if config.get('create_user'):
             lines.append(f"  Username:                 {config.get('username', '?')}")
@@ -2070,9 +2146,11 @@ class ReviewScreen(QWidget):
 
         if config.get('partitioning') == 'erase':
             bt = config.get('boot_type', '')
+            root_fs = config.get('root_fs', 'ext4')
             if bt == 'uefi':
+                efi_size = config.get('efi_size', 96)
                 jobs.append("  → Create partition table (GPT)")
-                jobs.append("  → Create EFI partition (96 MB, FAT32)")
+                jobs.append(f"  → Create EFI partition ({efi_size} MB, FAT32)")
             elif bt == 'bios_gpt':
                 jobs.append("  → Create partition table (GPT)")
                 jobs.append("  → Create BIOS boot partition (1 MB)")
@@ -2080,8 +2158,12 @@ class ReviewScreen(QWidget):
                 jobs.append("  → Create partition table (MBR)")
 
             if config.get('separate_boot'):
-                jobs.append(f"  → Create /boot partition ({config.get('boot_size', 512)} MB, ext4)")
-            jobs.append("  → Create root partition (remaining space, ext4)")
+                boot_fs = config.get('boot_fs', 'ext4')
+                jobs.append(f"  → Create /boot partition ({config.get('boot_size', 512)} MB, {boot_fs})")
+            jobs.append(f"  → Create root partition (remaining space, {root_fs})")
+        else:
+            root_fs = config.get('root_fs', 'ext4')
+            jobs.append(f"  → Format root partition ({root_fs})")
 
         if config.get('luks_enabled'):
             jobs.append("  → Setup LUKS1 encryption on root partition")
@@ -2418,9 +2500,16 @@ class GlitchInstaller(QMainWindow):
             self.config['boot_type'] = self.screen_partition.combo_boot_type.currentData()
             self.config['separate_boot'] = self.screen_partition.chk_separate_boot.isChecked()
             self.config['boot_size'] = self.screen_partition.spin_boot_size.value()
+            self.config['root_fs'] = self.screen_partition.combo_root_fs.currentData()
+            self.config['efi_size'] = self.screen_partition.spin_efi_size.value()
+            if self.config['separate_boot']:
+                self.config['boot_fs'] = self.screen_partition.combo_boot_fs.currentData()
+            else:
+                self.config['boot_fs'] = 'ext4'
         elif self.screen_partition.radio_existing.isChecked():
             self.config['partitioning'] = 'existing'
             self.config['data_partition'] = self.screen_partition.combo_root_part.currentData()
+            self.config['root_fs'] = self.screen_partition.combo_existing_root_fs.currentData()
             efi = self.screen_partition.combo_efi_part.currentData()
             boot = self.screen_partition.combo_boot_part.currentData()
             if efi:
@@ -2597,3 +2686,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
