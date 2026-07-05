@@ -1,9 +1,9 @@
 [Desktop Entry]
 Version=1.0
 Type=Application
-Comment[en_GB]=Install your system to disk!
+Comment[en_GB]=Install Glitch Linux
 Name=Glitch Installer
-Exec=/usr/bin/glitchinstall
+Exec=/usr/bin/glitch-install
 Icon=/usr/share/glitchinstall/glitchinstall.png
 Terminal=false
 Categories=Utility;
